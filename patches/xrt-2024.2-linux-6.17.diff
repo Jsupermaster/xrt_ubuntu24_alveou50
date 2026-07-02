@@ -1,0 +1,292 @@
+# XRT 2024.2 → Linux 6.17 compatibility patch (informational unified diff)
+#
+# Base:  git tag 202420.2.18.179 of https://github.com/Xilinx/XRT.git
+# Scope: 11 files under src/runtime_src/core/{common/drv/include,pcie/driver/linux/xocl}
+# Note:  This file is provided for review only. install.sh does not apply it;
+#        it overlays the pre-patched files under xrt-overlay/ directly.
+#
+--- a/src/runtime_src/core/common/drv/include/xrt_cu.h
++++ b/src/runtime_src/core/common/drv/include/xrt_cu.h
+@@ -22,8 +22,27 @@
+ #include <linux/io.h>
+ #include <linux/kthread.h>
+ #include <linux/circ_buf.h>
++#include <linux/timer.h>	/* for timer_container_of / timer_delete{_sync} on 6.15+ */
+ #include "kds_command.h"
+ 
++/* Linux 6.15 removed the legacy timer aliases:
++ *   from_timer()      -> timer_container_of()
++ *   del_timer()       -> timer_delete()
++ *   del_timer_sync()  -> timer_delete_sync()
++ * Map the old spellings so common/drv/xrt_cu.c keeps compiling. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
++#ifndef from_timer
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#endif
++#ifndef del_timer
++#define del_timer(t) timer_delete(t)
++#endif
++#ifndef del_timer_sync
++#define del_timer_sync(t) timer_delete_sync(t)
++#endif
++#endif
++
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
+ #define ioremap_nocache         ioremap
+ #endif
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/QDMA/linux-kernel/driver/libqdma/qdma_compat.h
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/lib/libqdma/QDMA/linux-kernel/driver/libqdma/qdma_compat.h
+@@ -28,8 +28,27 @@
+ 
+ #include <linux/version.h>
+ #include <linux/wait.h>
++#include <linux/timer.h>
+ #include <asm/barrier.h>
+ 
++/* Linux 6.15 removed the legacy timer aliases:
++ *   from_timer()      -> timer_container_of()
++ *   del_timer()       -> timer_delete()
++ *   del_timer_sync()  -> timer_delete_sync()
++ * Map the old spellings to the new ones. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
++#ifndef from_timer
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#endif
++#ifndef del_timer
++#define del_timer(t) timer_delete(t)
++#endif
++#ifndef del_timer_sync
++#define del_timer_sync(t) timer_delete_sync(t)
++#endif
++#endif
++
+ /**
+  * if linux kernel version is < 3.19.0
+  * then define the dma_rmb and dma_wmb
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/lib/libxdma.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/lib/libxdma.c
+@@ -4344,7 +4344,9 @@
+ MODULE_DESCRIPTION(DRV_MODULE_DESC);
+ MODULE_VERSION(DRV_MODULE_VERSION);
+ MODULE_LICENSE("GPL v2");
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0) || defined(RHEL_9_0_GE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("DMA_BUF");
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0) || defined(RHEL_9_0_GE)
+ MODULE_IMPORT_NS(DMA_BUF);
+ #endif
+ 
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/Makefile
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/mgmtpf/Makefile
+@@ -99,6 +99,10 @@
+ XILINXINCLUDE := -I$(ROOT)/../include -I$(ROOT)/../../../../include -I$(ROOT)/../../../../common/drv/include
+ 
+ ccflags-y += $(XILINXINCLUDE) -DPF=MGMTPF
++# Linux 6.11 changed platform_driver::remove signature from int(*)(...) to void(*)(...).
++# XRT's many .remove= callbacks still return int. The kernel always ignored that return,
++# so downgrade the warning to keep compiling on 6.11+ without rewriting 60+ callbacks.
++ccflags-y += -Wno-error=incompatible-pointer-types
+ ifeq ($(DEBUG),1)
+ ccflags-y += -DDEBUG
+ endif
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/subdev/p2p.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/subdev/p2p.c
+@@ -513,7 +513,18 @@
+ 	mb_req->req = XCL_MAILBOX_REQ_READ_P2P_BAR_ADDR;
+ 	mb_p2p = (struct xcl_mailbox_p2p_bar_addr *)mb_req->data;
+ 
++	/* If IOMMU translates this device's addresses, peer can't use raw PCI
++	 * BAR for P2P → advertise zero length so peer falls back.
++	 *
++	 * Linux 6.8 removed iommu_present(bus); the modern equivalent is the
++	 * per-device device_iommu_mapped(), which is also more accurate (the
++	 * old code asked "is any IOMMU on the bus?", but for P2P we really
++	 * care about THIS device). */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 8, 0)
++	if (!device_iommu_mapped(&pcidev->dev)){
++#else
+ 	if (!iommu_present(&pci_bus_type)){
++#endif
+ 		mb_p2p->p2p_bar_len = pci_resource_len(pcidev, p2p->p2p_bar_idx);
+ 		mb_p2p->p2p_bar_addr = pci_resource_start(pcidev,
+ 				p2p->p2p_bar_idx);
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/subdev/ulite.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/subdev/ulite.c
+@@ -188,6 +188,35 @@
+ 
+ static int ulite_transmit(struct uart_port *port, int stat)
+ {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
++	/* Linux 6.10 replaced uart_state::xmit (struct circ_buf) with a kfifo
++	 * embedded in tty_port (xmit_fifo). Use the new helpers; uart_fifo_out
++	 * itself updates port->icount.tx, so we don't increment it again. */
++	struct tty_port *tport = &port->state->port;
++	u8 ch;
++
++	if (stat & ULITE_STATUS_TXFULL)
++		return 0;
++
++	if (port->x_char) {
++		uart_out32(port->x_char, ULITE_TX, port);
++		port->x_char = 0;
++		port->icount.tx++;
++		return 1;
++	}
++
++	if (kfifo_is_empty(&tport->xmit_fifo) || uart_tx_stopped(port))
++		return 0;
++
++	if (!uart_fifo_out(port, &ch, 1))
++		return 0;
++	uart_out32(ch, ULITE_TX, port);
++
++	if (kfifo_len(&tport->xmit_fifo) < WAKEUP_CHARS)
++		uart_write_wakeup(port);
++
++	return 1;
++#else
+ 	struct circ_buf *xmit  = &port->state->xmit;
+ 
+ 	if (stat & ULITE_STATUS_TXFULL)
+@@ -212,6 +241,7 @@
+ 		uart_write_wakeup(port);
+ 
+ 	return 1;
++#endif
+ }
+ 
+ static void ulite_worker(struct uart_port *port)
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/subdev/xiic.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/subdev/xiic.c
+@@ -861,7 +861,14 @@
+ 
+ static struct i2c_adapter xiic_adapter = {
+ 	.owner = THIS_MODULE,
++	/* I2C_CLASS_SPD was removed in Linux 6.10 (SDRAM SPD i2c class no
++	 * longer used by the kernel). The HWMON hint is what actually matches
++	 * the LM63 thermal chip on this bus. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 10, 0)
++	.class = I2C_CLASS_HWMON,
++#else
+ 	.class = I2C_CLASS_HWMON | I2C_CLASS_SPD,
++#endif
+ 	.algo = &xiic_algorithm,
+ };
+ 
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/userpf/Makefile
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/userpf/Makefile
+@@ -121,6 +121,10 @@
+ XILINXINCLUDE := -I$(ROOT) -I$(ROOT)/../include -I$(ROOT)/../../../../include -I$(ROOT)/../../../../common/drv/include
+ 
+ ccflags-y += $(XILINXINCLUDE) -DPF=USERPF -D__XRT__ -DMBOX_INTERRUPT_DISABLE
++# Linux 6.11 changed platform_driver::remove signature from int(*)(...) to void(*)(...).
++# XRT's many .remove= callbacks still return int. The kernel always ignored that return,
++# so downgrade the warning to keep compiling on 6.11+ without rewriting 60+ callbacks.
++ccflags-y += -Wno-error=incompatible-pointer-types
+ ifeq ($(DEBUG),1)
+ ccflags-y += -DDEBUG
+ endif
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_drm.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_drm.c
+@@ -22,8 +22,24 @@
+ #endif
+ #if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)) || \
+ 	defined(RHEL_RELEASE_VERSION)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
++/* <linux/pfn_t.h> and the pfn_t type were removed in 6.16. vmf_insert_mixed()
++ * was updated to take a plain unsigned long pfn directly. Emulate the small
++ * subset of the old API surface that this file uses, so the function body
++ * downstream stays unchanged. PFN_MAP / PFN_DEV were DAX/zone hints that the
++ * core mm now handles internally; ignoring them here is safe. */
++typedef unsigned long pfn_t;
++#ifndef PFN_MAP
++#define PFN_MAP 0
++#endif
++#ifndef PFN_DEV
++#define PFN_DEV 0
++#endif
++#define phys_to_pfn_t(phys, flags) ((unsigned long)((phys) >> PAGE_SHIFT))
++#else
+ #include <linux/pfn_t.h>
+ #endif
++#endif
+ #include <linux/pagemap.h>
+ #include <linux/log2.h>
+ #include <linux/mmzone.h>
+@@ -497,6 +513,17 @@
+ 	.read		= drm_read,
+ 	.unlocked_ioctl = xocl_drm_ioctl,
+ 	.release	= drm_release,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++	/*
++	 * patch 0011: 6.17 drm_open_helper() enforces
++	 *   WARN_ON_ONCE(!(filp->f_op->fop_flags & FOP_UNSIGNED_OFFSET))
++	 * GEM/DRM device files use unsigned 64-bit mmap offset tokens, so the
++	 * fops must declare FOP_UNSIGNED_OFFSET (DEFINE_DRM_GEM_FOPS sets it
++	 * automatically; our hand-rolled fops must set it explicitly), else
++	 * every open() of the user PF DRM node returns -EINVAL.
++	 */
++	.fop_flags	= FOP_UNSIGNED_OFFSET,
++#endif
+ };
+ 
+ static const struct vm_operations_struct xocl_vm_ops = {
+@@ -558,7 +585,9 @@
+ #endif
+ 	.name				= XOCL_MODULE_NAME,
+ 	.desc				= XOCL_DRIVER_DESC,
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 16, 0)
+ 	.date				= driver_date,
++#endif
+ };
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0) || defined(RHEL_8_5_GE)
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_drv.c
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/userpf/xocl_drv.c
+@@ -2053,6 +2053,8 @@
+ MODULE_DESCRIPTION(XOCL_DRIVER_DESC);
+ MODULE_AUTHOR("Lizhi Hou <lizhi.hou@xilinx.com>");
+ MODULE_LICENSE("GPL v2");
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)  || defined(RHEL_9_0_GE)
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++MODULE_IMPORT_NS("DMA_BUF");
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5,16,0)  || defined(RHEL_9_0_GE)
+ MODULE_IMPORT_NS(DMA_BUF);
+ #endif
+--- a/src/runtime_src/core/pcie/driver/linux/xocl/xocl_drv.h
++++ b/src/runtime_src/core/pcie/driver/linux/xocl/xocl_drv.h
+@@ -43,6 +43,32 @@
+ #include <linux/types.h>
+ #include <linux/moduleparam.h>
+ #include <linux/cdev.h>
++#include <linux/vmalloc.h>	/* 6.17+ no longer pulls vmalloc/vzalloc/vfree transitively */
++#include <linux/timer.h>	/* needed for timer_container_of / timer_delete_sync on 6.15+ */
++
++/* Linux 6.12 removed no_llseek; map it to noop_llseek for out-of-tree drivers.
++ * Semantic difference (no_llseek returned -ESPIPE, noop_llseek returns 0) is
++ * irrelevant for the debug/trace file_operations that use it here. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
++#define no_llseek noop_llseek
++#endif
++
++/* Linux 6.15 removed the legacy timer aliases:
++ *   from_timer()      -> timer_container_of()
++ *   del_timer()       -> timer_delete()
++ *   del_timer_sync()  -> timer_delete_sync()
++ * Map the old spellings to the new ones so the existing callsites compile. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
++#define from_timer(var, callback_timer, timer_fieldname) \
++	timer_container_of(var, callback_timer, timer_fieldname)
++#define del_timer(t) timer_delete(t)
++#define del_timer_sync(t) timer_delete_sync(t)
++#endif
++
++/* Linux 6.13 dropped the _le suffix on the only-LE crc32c helper. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
++#define crc32c_le(seed, data, len) crc32c((seed), (data), (len))
++#endif
+ 
+ #include "xocl_types.h"
+ #include "xclbin.h"
